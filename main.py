@@ -1,6 +1,6 @@
 """
 AI Driven Impact Analyzer - FastAPI Backend
-Uses Groq (Llama 3) to intelligently analyze GitHub Pull Requests.
+Uses Groq (Llama 3) for AI analysis with rule-based fallback.
 """
 
 from fastapi import FastAPI, HTTPException
@@ -12,9 +12,8 @@ import os
 import json
 from typing import Optional
 
-app = FastAPI(title="AI Impact Analyzer", version="2.0.0")
+app = FastAPI(title="AI Impact Analyzer", version="2.1.0")
 
-# Enable CORS for frontend communication
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,6 +34,81 @@ class AnalysisResponse(BaseModel):
     suggested_tests: list[str]
     risk_level: str
     ai_explanation: str
+    analysis_mode: str  # "ai" or "fallback" — tells frontend which mode was used
+
+# --- Rule-Based Fallback Logic ---
+
+MODULE_RULES = {
+    "payment":    "Payment Module",
+    "auth":       "Authentication Module",
+    "order":      "Order Management Module",
+    "database":   "Database Layer",
+    "db":         "Database Layer",
+    "service":    "Service Layer",
+    "controller": "Controller Layer",
+}
+
+TEST_SUGGESTIONS = {
+    "Payment Module":          ["Test payment success flow", "Test refund logic", "Test payment gateway timeout handling"],
+    "Authentication Module":   ["Test login with valid credentials", "Test token validation", "Test session expiry"],
+    "Order Management Module": ["Test order creation flow", "Test order cancellation", "Test order status transitions"],
+    "Database Layer":          ["Test read/write operations", "Test transaction rollback", "Test connection pooling"],
+    "Service Layer":           ["Test service contract validation", "Test service failure handling"],
+    "Controller Layer":        ["Test API endpoint responses", "Test request validation"],
+    "Core Application Module": ["Run full regression suite", "Test integration touchpoints"],
+}
+
+def rule_based_analysis(changed_files: list[str]) -> dict:
+    """
+    Fallback: rule-based module detection and risk scoring.
+    Used when Groq API is unavailable or rate limited.
+    """
+    def detect_module(filename: str) -> str:
+        lower = filename.lower()
+        for keyword, module in MODULE_RULES.items():
+            if keyword in lower:
+                return module
+        return "Core Application Module"
+
+    modules = list(dict.fromkeys(detect_module(f) for f in changed_files))
+
+    tests = []
+    seen = set()
+    for module in modules:
+        for test in TEST_SUGGESTIONS.get(module, []):
+            if test not in seen:
+                tests.append(test)
+                seen.add(test)
+
+    # Risk scoring
+    risk = "LOW"
+    reasons = []
+
+    if len(changed_files) > 5:
+        risk = "HIGH"
+        reasons.append(f"{len(changed_files)} files modified — large changeset increases regression risk.")
+    if "Database Layer" in modules:
+        risk = "HIGH"
+        reasons.append("Database Layer affected — schema or query changes carry elevated risk.")
+    if risk != "HIGH" and len(modules) >= 2:
+        risk = "MEDIUM"
+        reasons.append(f"Changes span {len(modules)} modules, requiring cross-module validation.")
+    if risk == "LOW":
+        reasons.append("Minimal scope — single module with few files. Standard smoke tests should suffice.")
+
+    explanation = (
+        f"[Fallback Mode] Risk assessed as {risk}. "
+        + " ".join(reasons)
+        + f" Impacted modules: {', '.join(modules)}."
+        + " Note: AI analysis was unavailable, using rule-based detection."
+    )
+
+    return {
+        "impacted_modules": modules,
+        "suggested_tests": tests,
+        "risk_level": risk,
+        "ai_explanation": explanation,
+    }
 
 # --- GitHub API Helper ---
 
@@ -54,7 +128,6 @@ async def fetch_pr_files(owner: str, repo: str, pr_number: str, token: Optional[
     url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files"
     headers = {"Accept": "application/vnd.github+json"}
 
-    # Use token from request, fall back to environment variable
     resolved_token = token or os.getenv("GITHUB_TOKEN")
     if resolved_token:
         headers["Authorization"] = f"Bearer {resolved_token}"
@@ -76,13 +149,12 @@ async def fetch_pr_files(owner: str, repo: str, pr_number: str, token: Optional[
 async def analyze_with_groq(changed_files: list[str]) -> dict:
     """
     Send changed files to Groq (Llama 3) for intelligent impact analysis.
-    Returns structured JSON with modules, tests, risk level, and explanation.
+    Raises an exception if Groq is unavailable — caller handles fallback.
     """
     groq_api_key = os.getenv("GROQ_API_KEY")
     if not groq_api_key:
-        raise HTTPException(status_code=500, detail="GROQ_API_KEY not configured on server.")
+        raise ValueError("GROQ_API_KEY not set")
 
-    # Build a detailed prompt for structured JSON output
     prompt = f"""You are an expert software engineering analyst. Analyze the following list of changed files from a GitHub Pull Request and return a structured impact analysis.
 
 Changed files:
@@ -118,18 +190,15 @@ Rules:
     }
 
     payload = {
-        "model": "llama-3.3-70b-versatile",  # Fast and capable Groq model
+        "model": "llama-3.3-70b-versatile",
         "messages": [
             {
                 "role": "system",
                 "content": "You are a senior software engineering analyst. You always respond with valid JSON only, no markdown formatting, no extra text."
             },
-            {
-                "role": "user",
-                "content": prompt
-            }
+            {"role": "user", "content": prompt}
         ],
-        "temperature": 0.2,       # Low temperature for consistent, structured output
+        "temperature": 0.2,
         "max_tokens": 1024,
     }
 
@@ -140,10 +209,11 @@ Rules:
             json=payload
         )
 
+    if resp.status_code == 429:
+        raise ValueError("Groq rate limit exceeded")
     if resp.status_code != 200:
-        raise HTTPException(status_code=500, detail=f"Groq API error: {resp.text}")
+        raise ValueError(f"Groq API returned {resp.status_code}")
 
-    # Extract the AI response text
     ai_text = resp.json()["choices"][0]["message"]["content"].strip()
 
     # Strip markdown backticks if model accidentally adds them
@@ -151,20 +221,15 @@ Rules:
     ai_text = re.sub(r"^```\s*", "", ai_text)
     ai_text = re.sub(r"\s*```$", "", ai_text)
 
-    try:
-        result = json.loads(ai_text)
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="AI returned invalid JSON. Please try again.")
+    result = json.loads(ai_text)  # Let caller catch JSONDecodeError
 
-    # Validate required fields exist
     for field in ["impacted_modules", "suggested_tests", "risk_level", "ai_explanation"]:
         if field not in result:
-            raise HTTPException(status_code=500, detail=f"AI response missing field: {field}")
+            raise ValueError(f"AI response missing field: {field}")
 
-    # Normalize risk level to uppercase
     result["risk_level"] = result["risk_level"].upper()
     if result["risk_level"] not in ["LOW", "MEDIUM", "HIGH"]:
-        result["risk_level"] = "MEDIUM"  # Safe fallback
+        result["risk_level"] = "MEDIUM"
 
     return result
 
@@ -173,33 +238,40 @@ Rules:
 @app.post("/analyze-pr", response_model=AnalysisResponse)
 async def analyze_pr(request: PRRequest):
     """
-    Analyze a GitHub Pull Request using Groq AI (Llama 3) and return:
-    - Changed files (from GitHub API)
-    - Impacted business modules (AI detected)
-    - Suggested regression tests (AI generated)
-    - Risk level: LOW / MEDIUM / HIGH (AI calculated)
-    - Human-readable AI explanation
+    Analyze a GitHub Pull Request.
+    Tries Groq AI first — silently falls back to rule-based logic if unavailable.
     """
-    # Step 1: Parse and validate PR URL
     owner, repo, pr_number = parse_pr_url(request.pr_url)
-
-    # Step 2: Fetch changed files from GitHub
     changed_files = await fetch_pr_files(owner, repo, pr_number, request.github_token)
 
     if not changed_files:
         raise HTTPException(status_code=422, detail="No changed files found in this PR.")
 
-    # Step 3: Send to Groq AI for full analysis
-    ai_result = await analyze_with_groq(changed_files)
+    # Try Groq AI first
+    try:
+        result = await analyze_with_groq(changed_files)
+        analysis_mode = "ai"
+        print(f"✅ Groq AI analysis successful for PR with {len(changed_files)} files")
+
+    except Exception as e:
+        # Silently fall back to rule-based logic
+        print(f"⚠️  Groq unavailable ({e}), falling back to rule-based analysis")
+        result = rule_based_analysis(changed_files)
+        analysis_mode = "fallback"
 
     return AnalysisResponse(
         changed_files=changed_files,
-        impacted_modules=ai_result["impacted_modules"],
-        suggested_tests=ai_result["suggested_tests"],
-        risk_level=ai_result["risk_level"],
-        ai_explanation=ai_result["ai_explanation"],
+        impacted_modules=result["impacted_modules"],
+        suggested_tests=result["suggested_tests"],
+        risk_level=result["risk_level"],
+        ai_explanation=result["ai_explanation"],
+        analysis_mode=analysis_mode,
     )
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "ai": "groq/llama-3.3-70b-versatile"}
+    return {
+        "status": "ok",
+        "ai": "groq/llama-3.3-70b-versatile",
+        "fallback": "rule-based"
+    }
