@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
 import re
+import os
 from typing import Optional
 
 app = FastAPI(title="AI Impact Analyzer", version="1.0.0")
@@ -20,6 +21,7 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
 # --- Request / Response Models ---
 
 class PRRequest(BaseModel):
@@ -46,12 +48,12 @@ MODULE_RULES = {
 }
 
 TEST_SUGGESTIONS = {
-    "Payment Module":        ["Test payment success flow", "Test refund logic", "Test payment gateway timeout handling"],
-    "Authentication Module": ["Test login with valid credentials", "Test token validation", "Test session expiry"],
+    "Payment Module":          ["Test payment success flow", "Test refund logic", "Test payment gateway timeout handling"],
+    "Authentication Module":   ["Test login with valid credentials", "Test token validation", "Test session expiry"],
     "Order Management Module": ["Test order creation flow", "Test order cancellation", "Test order status transitions"],
-    "Database Layer":        ["Test read/write operations", "Test transaction rollback", "Test connection pooling"],
-    "Service Layer":         ["Test service contract validation", "Test service failure handling"],
-    "Controller Layer":      ["Test API endpoint responses", "Test request validation"],
+    "Database Layer":          ["Test read/write operations", "Test transaction rollback", "Test connection pooling"],
+    "Service Layer":           ["Test service contract validation", "Test service failure handling"],
+    "Controller Layer":        ["Test API endpoint responses", "Test request validation"],
     "Core Application Module": ["Run full regression suite", "Test integration touchpoints"],
 }
 
@@ -79,9 +81,9 @@ def calculate_risk(changed_files: list[str], modules: list[str]) -> tuple[str, s
     Determine risk level and generate a human-readable explanation.
     Rules:
       - More than 5 files changed → HIGH
-      - Database Layer affected  → HIGH
-      - 2+ distinct modules      → MEDIUM
-      - Otherwise                → LOW
+      - Database Layer affected   → HIGH
+      - 2+ distinct modules       → MEDIUM
+      - Otherwise                 → LOW
     """
     reasons = []
     risk = "LOW"
@@ -126,8 +128,11 @@ async def fetch_pr_files(owner: str, repo: str, pr_number: str, token: Optional[
     """Call GitHub REST API to retrieve changed files for a given PR."""
     url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files"
     headers = {"Accept": "application/vnd.github+json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+
+    # Use token from request, fall back to environment variable
+    resolved_token = token or os.getenv("GITHUB_TOKEN")
+    if resolved_token:
+        headers["Authorization"] = f"Bearer {resolved_token}"
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.get(url, headers=headers)
