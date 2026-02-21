@@ -1,6 +1,6 @@
 """
 AI Driven Impact Analyzer - FastAPI Backend
-Analyzes GitHub Pull Requests for impact assessment and risk scoring.
+Uses Groq (Llama 3) to intelligently analyze GitHub Pull Requests.
 """
 
 from fastapi import FastAPI, HTTPException
@@ -9,9 +9,10 @@ from pydantic import BaseModel
 import httpx
 import re
 import os
+import json
 from typing import Optional
 
-app = FastAPI(title="AI Impact Analyzer", version="1.0.0")
+app = FastAPI(title="AI Impact Analyzer", version="2.0.0")
 
 # Enable CORS for frontend communication
 app.add_middleware(
@@ -26,7 +27,7 @@ app.add_middleware(
 
 class PRRequest(BaseModel):
     pr_url: str
-    github_token: Optional[str] = None  # Optional: avoids GitHub rate limits
+    github_token: Optional[str] = None
 
 class AnalysisResponse(BaseModel):
     changed_files: list[str]
@@ -34,82 +35,6 @@ class AnalysisResponse(BaseModel):
     suggested_tests: list[str]
     risk_level: str
     ai_explanation: str
-
-# --- Module Detection Logic ---
-
-MODULE_RULES = {
-    "payment":    "Payment Module",
-    "auth":       "Authentication Module",
-    "order":      "Order Management Module",
-    "database":   "Database Layer",
-    "db":         "Database Layer",
-    "service":    "Service Layer",
-    "controller": "Controller Layer",
-}
-
-TEST_SUGGESTIONS = {
-    "Payment Module":          ["Test payment success flow", "Test refund logic", "Test payment gateway timeout handling"],
-    "Authentication Module":   ["Test login with valid credentials", "Test token validation", "Test session expiry"],
-    "Order Management Module": ["Test order creation flow", "Test order cancellation", "Test order status transitions"],
-    "Database Layer":          ["Test read/write operations", "Test transaction rollback", "Test connection pooling"],
-    "Service Layer":           ["Test service contract validation", "Test service failure handling"],
-    "Controller Layer":        ["Test API endpoint responses", "Test request validation"],
-    "Core Application Module": ["Run full regression suite", "Test integration touchpoints"],
-}
-
-def detect_module(filename: str) -> str:
-    """Map a filename to its business module using keyword rules."""
-    lower = filename.lower()
-    for keyword, module in MODULE_RULES.items():
-        if keyword in lower:
-            return module
-    return "Core Application Module"
-
-def get_test_cases(modules: list[str]) -> list[str]:
-    """Gather unique test cases for all affected modules."""
-    tests = []
-    seen = set()
-    for module in modules:
-        for test in TEST_SUGGESTIONS.get(module, []):
-            if test not in seen:
-                tests.append(test)
-                seen.add(test)
-    return tests
-
-def calculate_risk(changed_files: list[str], modules: list[str]) -> tuple[str, str]:
-    """
-    Determine risk level and generate a human-readable explanation.
-    Rules:
-      - More than 5 files changed → HIGH
-      - Database Layer affected   → HIGH
-      - 2+ distinct modules       → MEDIUM
-      - Otherwise                 → LOW
-    """
-    reasons = []
-    risk = "LOW"
-
-    if len(changed_files) > 5:
-        risk = "HIGH"
-        reasons.append(f"{len(changed_files)} files were modified — large changesets increase regression probability.")
-
-    if "Database Layer" in modules:
-        risk = "HIGH"
-        reasons.append("Database Layer changes detected — schema or query modifications carry elevated risk.")
-
-    if risk != "HIGH" and len(modules) >= 2:
-        risk = "MEDIUM"
-        reasons.append(f"Changes span {len(modules)} modules ({', '.join(modules)}), requiring cross-module validation.")
-
-    if risk == "LOW":
-        reasons.append("Minimal scope: single module with few files changed. Standard smoke tests should suffice.")
-
-    explanation = (
-        f"Risk assessed as {risk}. "
-        + " ".join(reasons)
-        + f" Impacted modules: {', '.join(modules)}."
-        + " Review suggested test cases before merging."
-    )
-    return risk, explanation
 
 # --- GitHub API Helper ---
 
@@ -146,37 +71,135 @@ async def fetch_pr_files(owner: str, repo: str, pr_number: str, token: Optional[
 
     return [f["filename"] for f in resp.json()]
 
+# --- Groq AI Analysis ---
+
+async def analyze_with_groq(changed_files: list[str]) -> dict:
+    """
+    Send changed files to Groq (Llama 3) for intelligent impact analysis.
+    Returns structured JSON with modules, tests, risk level, and explanation.
+    """
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    if not groq_api_key:
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY not configured on server.")
+
+    # Build a detailed prompt for structured JSON output
+    prompt = f"""You are an expert software engineering analyst. Analyze the following list of changed files from a GitHub Pull Request and return a structured impact analysis.
+
+Changed files:
+{json.dumps(changed_files, indent=2)}
+
+Your task:
+1. Identify which business modules are impacted based on the file paths and names
+2. Suggest specific regression test cases that should be run
+3. Calculate the risk level (LOW, MEDIUM, or HIGH) based on:
+   - Number of files changed (>5 = higher risk)
+   - Sensitivity of modules affected (auth, payment, database = higher risk)
+   - Number of modules affected (more modules = higher risk)
+4. Write a clear, concise explanation of the risk for an engineering team
+
+Respond ONLY with a valid JSON object in this exact format, no extra text:
+{{
+  "impacted_modules": ["Module Name 1", "Module Name 2"],
+  "suggested_tests": ["Test case 1", "Test case 2", "Test case 3"],
+  "risk_level": "HIGH",
+  "ai_explanation": "A clear 2-3 sentence explanation of the risk and what the team should watch out for before merging."
+}}
+
+Rules:
+- risk_level must be exactly one of: LOW, MEDIUM, HIGH
+- impacted_modules should be human-readable business module names
+- suggested_tests should be specific and actionable, not generic
+- ai_explanation should mention specific files or patterns you noticed
+- Return valid JSON only, no markdown, no backticks"""
+
+    headers = {
+        "Authorization": f"Bearer {groq_api_key}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model": "llama-3.3-70b-versatile",  # Fast and capable Groq model
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a senior software engineering analyst. You always respond with valid JSON only, no markdown formatting, no extra text."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        "temperature": 0.2,       # Low temperature for consistent, structured output
+        "max_tokens": 1024,
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers,
+            json=payload
+        )
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=500, detail=f"Groq API error: {resp.text}")
+
+    # Extract the AI response text
+    ai_text = resp.json()["choices"][0]["message"]["content"].strip()
+
+    # Strip markdown backticks if model accidentally adds them
+    ai_text = re.sub(r"^```json\s*", "", ai_text)
+    ai_text = re.sub(r"^```\s*", "", ai_text)
+    ai_text = re.sub(r"\s*```$", "", ai_text)
+
+    try:
+        result = json.loads(ai_text)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="AI returned invalid JSON. Please try again.")
+
+    # Validate required fields exist
+    for field in ["impacted_modules", "suggested_tests", "risk_level", "ai_explanation"]:
+        if field not in result:
+            raise HTTPException(status_code=500, detail=f"AI response missing field: {field}")
+
+    # Normalize risk level to uppercase
+    result["risk_level"] = result["risk_level"].upper()
+    if result["risk_level"] not in ["LOW", "MEDIUM", "HIGH"]:
+        result["risk_level"] = "MEDIUM"  # Safe fallback
+
+    return result
+
 # --- Main Endpoint ---
 
 @app.post("/analyze-pr", response_model=AnalysisResponse)
 async def analyze_pr(request: PRRequest):
     """
-    Analyze a GitHub Pull Request and return:
-    - Changed files
-    - Impacted business modules
-    - Suggested regression tests
-    - Risk level (LOW / MEDIUM / HIGH)
-    - Human-readable explanation
+    Analyze a GitHub Pull Request using Groq AI (Llama 3) and return:
+    - Changed files (from GitHub API)
+    - Impacted business modules (AI detected)
+    - Suggested regression tests (AI generated)
+    - Risk level: LOW / MEDIUM / HIGH (AI calculated)
+    - Human-readable AI explanation
     """
+    # Step 1: Parse and validate PR URL
     owner, repo, pr_number = parse_pr_url(request.pr_url)
+
+    # Step 2: Fetch changed files from GitHub
     changed_files = await fetch_pr_files(owner, repo, pr_number, request.github_token)
 
     if not changed_files:
         raise HTTPException(status_code=422, detail="No changed files found in this PR.")
 
-    # Detect modules (deduplicated, ordered)
-    modules = list(dict.fromkeys(detect_module(f) for f in changed_files))
-    suggested_tests = get_test_cases(modules)
-    risk_level, ai_explanation = calculate_risk(changed_files, modules)
+    # Step 3: Send to Groq AI for full analysis
+    ai_result = await analyze_with_groq(changed_files)
 
     return AnalysisResponse(
         changed_files=changed_files,
-        impacted_modules=modules,
-        suggested_tests=suggested_tests,
-        risk_level=risk_level,
-        ai_explanation=ai_explanation,
+        impacted_modules=ai_result["impacted_modules"],
+        suggested_tests=ai_result["suggested_tests"],
+        risk_level=ai_result["risk_level"],
+        ai_explanation=ai_result["ai_explanation"],
     )
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "ai": "groq/llama-3.3-70b-versatile"}
